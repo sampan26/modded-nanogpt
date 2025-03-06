@@ -276,10 +276,10 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 0.0015
+max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 256
-max_steps = 38146 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -292,14 +292,13 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
-    #return (0.1 + (1 - decay_ratio)) / (0.1 + 1) * max_lr
 
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log4.txt")
+log_file = os.path.join(log_dir, f"log_baseline.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
@@ -325,13 +324,11 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"Step: {step}, Validation Loss: {val_loss_accum}")
-        if val_loss_accum < 3.069505691528320:
-            break
+        if master_process and last_step:
+            print(f"Final Validation Loss: {val_loss_accum}")
     # do one step of the optimization
     model.train()
     optimizer.zero_grad()
-    if step > 30500:
-        grad_accum_steps = 2
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
