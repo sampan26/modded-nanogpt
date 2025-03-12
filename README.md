@@ -2,7 +2,5 @@
 
 Inspired by Modded NanoGPT by Keller Jordan, this variant comes from the code provided by Kaparthy on his Lets Build GPT-2 (124M) video on 4xA100
 
-Baseline: Best validation loss: 3.069505691528320; Training Time: 254.3 minutes
+Baseline loss (from Kaparthy's video repo): 3.126; Training Time: 260.17 minutes (including validation)
 
-
-2/19: Increased Learning Rate 2.5x. Trainign time: 231.6 miutes
