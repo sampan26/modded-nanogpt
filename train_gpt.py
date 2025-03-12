@@ -8,6 +8,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 import wandb
 # -----------------------------------------------------------------------------
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
+        x = x / rms
+        return x * self.weight
 
 class CausalSelfAttention(nn.Module):
 
@@ -58,9 +68,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -86,7 +96,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -107,7 +117,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_logits=True):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -121,10 +131,15 @@ class GPT(nn.Module):
             x = block(x)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        loss = None
+
         if targets is not None:
+            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+        if not return_logits:
+            logits=None
         return logits, loss
 
 
@@ -158,7 +173,7 @@ import tiktoken
 import numpy as np
 
 def load_tokens(filename):
-    npt = np.load(filename)
+    npt = np.load(filename, mmap_mode='r')
     npt = npt.astype(np.int32) # added after video
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
@@ -201,7 +216,7 @@ class DataLoaderLite:
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
-        return x, y
+        return x.cuda(), y.cuda()
 
 
 # -----------------------------------------------------------------------------
@@ -244,6 +259,7 @@ else:
 
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
+ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -251,7 +267,7 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 262144 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 131072 # 2**19, ~0.5M, in number of tokens
 B = 64 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -269,7 +285,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -299,16 +315,18 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log4.txt")
+log_file = os.path.join(log_dir, f"log_train1.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
+
+last_step = (max_steps - 1)
 
 start_time = time.time()
 for step in range(max_steps):
     t0 = time.time()
-    last_step = (step == max_steps - 1)
-
-    if step % 250 == 0 or last_step:
+    
+    # --------------- Evaluation SECTION  -----------------
+    if step > max_steps / 2 and step % 250 == 0 or step == last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -325,43 +343,44 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"Step: {step}, Validation Loss: {val_loss_accum}")
-        if val_loss_accum < 3.069505691528320:
+        if val_loss_accum < 3.126:
             break
-    # do one step of the optimization
+        
+    # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    optimizer.zero_grad()
-    if step > 30500:
-        grad_accum_steps = 2
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        # added after video, this field is also used by the forward pass.
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    # loss_accum = 0.0
+    # for micro_step in range(grad_accum_steps):
+    x, y = train_loader.next_batch()
+        # # added after video, this field is also used by the forward pass.
+        # if ddp:
+        #     model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+    with ctx:
+        _, loss = model(x, y, return_logits=False)
+    
+    # loss = loss / grad_accum_steps
+    # loss_accum += loss.detach()
+    loss.backward()
+    # if ddp:
+    #     dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    
     optimizer.step()
-    if device_type == "cuda":
-        torch.cuda.synchronize() # wait for the GPU to finish work
+    optimizer.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -----------------__
+    torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} train {loss.item():.6f}\n")
+
 if master_process:
     end_time = time.time()
     elapsed_time_minutes = (end_time - start_time) / 60
