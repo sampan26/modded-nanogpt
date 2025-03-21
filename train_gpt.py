@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from soap import SOAP
 import wandb
 # -----------------------------------------------------------------------------
 class Rotary(torch.nn.Module):
@@ -34,18 +35,9 @@ def apply_rotary_emb(x, cos, sin):
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    return torch.cat([y1, y2], 3).type_as(x)
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
-        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        x = x / rms
-        return x * self.weight
 
 class CausalSelfAttention(nn.Module):
 
@@ -56,7 +48,9 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1  # regularization
@@ -69,16 +63,15 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), is_causal=True) # flash attention
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
         return y
@@ -88,13 +81,13 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = nn.GELU(approximate='tanh')
+        #self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = F.relu(x).square() 
         x = self.c_proj(x)
         return x
 
@@ -102,22 +95,20 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
-    n_head: int = 12 # number of heads
+    n_head: int = 6 # number of heads
     n_embd: int = 768 # embedding dimension
 
 class GPT(nn.Module):
@@ -129,7 +120,6 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -161,7 +151,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
+        x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -298,8 +288,8 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 131072 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+total_batch_size = 262144 # 2**19, ~0.5M, in number of tokens
+B = 32 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -324,36 +314,41 @@ if ddp:
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 max_lr = 0.0015
-min_lr = max_lr * 0.1
 warmup_steps = 256
+warmdown_steps = 2048
 max_steps = 38146 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
     # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
+    if it < max_steps - warmdown_steps:
+        return max_lr
+    # 3) in between, use linear warmdown
+    else:
+        decay_ratio = (max_steps - it) / warmdown_steps
+        return decay_ratio * max_lr
     #return (0.1 + (1 - decay_ratio)) / (0.1 + 1) * max_lr
 
 # optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log_train1.txt")
+log_file = os.path.join(log_dir, f"6_heads_change_vocab_no_attn_rms.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
 last_step = (max_steps - 1)
 
+with torch.no_grad():
+    dummy_input = torch.zeros((B, T), dtype=torch.long).to(device)
+    model(dummy_input, targets=None, return_logits=True)
+
 start_time = time.time()
 for step in range(max_steps):
+    if step == 501:
+        break
     t0 = time.time()
     
     # --------------- Evaluation SECTION  -----------------
