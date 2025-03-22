@@ -270,7 +270,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 262144 # 2**19, ~0.5M, in number of tokens
-B = 32 # micro batch size
+B = 64 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -297,7 +297,7 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 max_lr = 0.0015
 warmup_steps = 256
 warmdown_steps = 2048
-max_steps = 38146 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 7000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -318,7 +318,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"soap.txt")
+log_file = os.path.join(log_dir, f"cg03_training_run.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
@@ -330,8 +330,6 @@ with torch.no_grad():
 
 start_time = time.time()
 for step in range(max_steps):
-    if step == 501:
-        break
     t0 = time.time()
     
     # --------------- Evaluation SECTION  -----------------
