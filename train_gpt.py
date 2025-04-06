@@ -122,7 +122,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
+        self.lm_head.weight.data.zero_()
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
 
@@ -165,8 +165,8 @@ class GPT(nn.Module):
 
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        optimizer1 = torch.optim.AdamW(self.lm_head.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0, fused=True)
-        optimizer2 = SOAP(self.transformer.h.parameters(), lr=0.5*learning_rate, betas=(.95, .95), weight_decay=0, precondition_frequency=50)
+        optimizer1 = torch.optim.AdamW(self.lm_head.parameters(), lr=0.9*learning_rate, betas=(0.9, 0.95), weight_decay=0, fused=True)
+        optimizer2 = SOAP(self.transformer.h.parameters(), lr=0.5*learning_rate, betas=(.95, .95), weight_decay=0, precondition_frequency=30)
         optimizers = [optimizer1, optimizer2]
         return optimizers
 
@@ -294,7 +294,7 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 0.0015
+max_lr = 0.0018
 warmup_steps = 256
 warmdown_steps = 2048
 max_steps = 7000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
@@ -318,7 +318,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"cg03_training_run.txt")
+log_file = os.path.join(log_dir, f"undo_changes_to_main_zero_18e-3-lr-5-head-9.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 

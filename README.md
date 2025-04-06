@@ -20,9 +20,11 @@ The speedup is due to the following changes:
 - Implemented RMSNorm (slightly faster than LayerNorm and Pytorch RMSNorm for some reason)
 - Switched from AdamW to SOAP optimizer
 - Changed to 6 attention heads instead of 12
+- Upgrade to pytorch 2.5.1
 
 
 
 Baseline loss: 3.126; Training Time: 260.17 minutes; avg step: 397ms
 3/19 loss: 3.125; Training Time: 139.93 minutes, avg step: 330ms
 3/21 loss: 3.124; Training Time: 48.31 minutes, avg step: 362 ms
+4/5 loss: 3.126; Training Time: 46.12 minutes, avg step: 330ms
